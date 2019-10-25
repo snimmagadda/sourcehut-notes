@@ -1,0 +1,449 @@
+* Introduction
+Sourcehut is a suite of open source (GPL v2) tools for software
+development. It consists of these composable mini-services...
+
+ * git.sr.ht: Git hosting and a web UI.
+ * hg.sr.ht: Mercurial hosting and a web UI.
+ * builds.sr.ht: Continuous integration supporting BSDs in addition to
+   various Linux distros.
+ * todo.sr.ht: Ticket/bug tracking.
+ * lists.sr.ht: Mailing lists.
+ * dispatch.sr.ht: task automation in response to various events.
+ * meta.sr.ht: Accounts and security
+ * paste.sr.ht: ad-hoc text file hosting.
+
+sr.ht is the hosted platform of the services which is public alpha as
+of this writing.
+
+This document records evaluation of sourcehut tools to build a
+self-hosted private mirror of a github repository and plug-in the CI
+infrastructure to build on supported platforms. Henceforth, focus
+would be on installing/configuring/running git.sr.ht, builds.sr.ht
+and dispatch.sr.ht tools alone.
+
+As of this writing, no official docker image is available and the
+recommended method of installation is to use Linux distro specific
+binary package repositories provided by the author. Mirrors and the
+respective signing key are available for Alpine, Arch and Debian Linux
+distributions. Note that Alpine package mirror is a 'work in progress'
+and could be missing dependencies while Debian package mirror worked
+as advertized.
+
+* Installation
+On an Ubuntu system...
+** Apline Linux
+   Download Alpine linux's virtual x86_64 installation image.
+   Install a VM using...
+   $ qemu-img create -f qcow2 alpine.img 10G
+   $ qemu-system-x86_64 -nographic -cdrom alpine.iso -boot order=d -drive file=alpine.img
+   Post install, reboot and launch the VM...
+   $ qemu-system-x86_64 -nographic -drive file=alpine.img
+   Configure apk to fetch sr.ht binary packages from mirror.sr.ht...
+   # echo "https://mirror.sr.ht/alpine/v3.10/sr.ht" >> /etc/apk/repositories
+   $ wget https://mirror.sr.ht/apline/alpine@sr.ht.rsa.pub
+   # mv alpine@sr.ht.rsa.pub /etc/apk/keys
+   # apk update && apk add git.sr.ht builds.sr.ht
+   Note: Complains about missing dependencies as it's a work in progress.
+** Debian/Ubuntu Linux
+   Configure apt to fetch from mirror.sr.ht...
+   # echo "deb https://mirrror.sr.ht/debian sid main" >> /etc/apt/source.list
+   $ wget -q https://mirror.sr.ht/debian/key.asc -O - | sudo apt-key --keyring /etc/apt/trusted.gpg.d/debian.sr.ht.gpg add -
+   $ sudo apt install srht-meta srht-git srht-dispatch python3-scmsrht
+
+* Configuration
+** Prerequisites
+   Configuring git.sr.ht requires golang, nginx, libssl-dev,
+   libffi-dev python3-dev gunicorn3...
+
+   $ sudo apt install golang-go nginx libssl-dev libffi-dev python3-dev gunicorn3
+
+   Note: golang version should be able to understand modules, i.e.,
+   atleast 1.11 and often times ubuntu binary packages lag. golang
+   recommends using longsleep/golang-backports binary repository.
+
+   python3-cryptography package on ubuntu is too old. Install latest
+   stable version using pip3...
+
+   $ sudo pip3 install cryptography
+
+   Verify that cryptography package is accessible via repl...
+   $ python3
+   >>> from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+   If it errors out, the package is too old.
+
+   Use 'gunicorn3' instead of 'gunicorn' in every systemd daemon
+   script at
+   /usr/lib/systemd/system/{srht-git.service,srht-dispatch.service,...}
+   and...
+
+   $ sudo systemctl daemon-reload
+   $ systemctl restart srht-meta.service srht-git.service srht-dispatch.service srht-git-webhooks.service
+
+    Setup a password for the the 'postgres' user in Postgresql...
+    $ sudo -u postgres psql
+    postgres=# password
+
+   The 'connection-string' should be
+   'postgresql://postgres:<password>@localhost/<module>.sr.ht'
+   for each module.
+
+** meta.sr.ht   
+   meta is the central authentication service and service bus for the
+   sr.ht network and a working meta.sr.ht is a basic requirement of
+   running any other sr.ht software.
+
+   Create "meta.sr.ht" database in Postgresql...
+   $ sudo -u postgres psql
+   postgres=# create database "meta.sr.ht";
+
+   Initialize database...
+   $ python3
+   >>> from metasrht.app import db
+   >>> db.create()
+
+** git.sr.ht
+Repository storage is at /var/lib/gitsrht and ownership/system user
+management is handled by the package.
+*** SSH configuration
+    A system-wide SSH authorization hook needs to be built with...
+    $ git clone https://git.sr.ht/~sircmpwn/git.sr.ht
+    $ cd git.sr.ht/gitsrht-dispatch
+    $ go install
+
+    Note: go version go1.13.1 linux/amd64
+
+    /usr/bin/gitsrht-dispatch would now be used by updating
+    /etc/ssh/sshd_config as...
+    AuthorizedKeysCommand=/usr/bin/gitsrht-dispatch "%u" "%h" "%t" "%k"
+    AuthorizedKeysCommandUser=root
+    PermitUserEnvironment SRHT_*
+*** Cronjob
+    Sourcehut needs to run a program periodically so sudo crontab -e
+    and add...
+    */20 * * * * gitsrht-periodic
+*** Nginx configuration
+    For HTTP(S) cloning, add the following location directives inside
+    the correct server block in /etc/nginx/nginx.conf...
+
+    location = /authorize {
+    	proxy_pass http://127.0.0.1:5001;
+    	proxy_pass_request_body off;
+    	proxy_set_header Content-Length "";
+    	proxy_set_header X-Original-URI $request_uri;
+    }
+
+    location ~ ^.*/(HEAD|info/refs|objects/info/.*|git-(upload|receive)-pack).*$ {
+    	auth_request /authorize;
+    	root /var/lib/git;
+    	fastcgi_pass unix:/run/fcgiwrap.sock;
+    	fastcgi_param SCRIPT_FILENAME /usr/lib/git-core/git-http-backend;
+    	fastcgi_param PATH_INFO $uri;
+    	fastcgi_param GIT_PROJECT_ROOT $document_root;
+    	fastcgi_param GIT_HTTP_EXPORT_ALL "";
+    	include fastcgi_params;
+    	gzip off;
+    }
+
+    Note: fcgiwrap should be installed. ('apt install fcgiwrap' if not
+    present)
+*** Config.ini
+    Begin with the example configuration provided with the package...
+    $ sudo cp /usr/share/doc/srht-git/examples/config.example.ini /etc/sr.ht/config.ini
+
+    Generate webhooks privateKey using 'srht-webhook-keygen' command and paste
+    the private key in the config.ini
+    $ srht-webhook-keygen
+    $ sudo systemctl restart srht-git.service
+
+    Set [git.sr.ht] and [meta.sr.ht] origin to 'localhost'
+    
+    Create 'git.sr.ht' database before configuring database...
+    postgres=# create database "git.sr.ht";
+    $ python3
+    >>> from girsrht.app import db
+    >>> db.create()
+
+** builds.sr.ht
+   TODO
+
+** dispatch.sr.ht
+   TODO
+
+* Notes
+- The custom AuthorizedKeysCommand program is run as 'root', however,
+  the command (gitsrht-dispatch) drops privileges to user's uid/gid
+  before exec-ing. Would be nice to have a setup/configuration that
+  eliminates the need to run it as root.
+
+* config.ini
+[sr.ht]
+#
+# The name of your network of sr.ht-based sites
+site-name=sourcehut
+#
+# The top-level info page for your site
+site-info=https://sourcehut.org
+#
+# {{ site-name }}, {{ site-blurb }}
+site-blurb=the hacker's forge
+#
+# If this != production, we add a banner to each page
+environment=development
+#
+# Contact information for the site owners
+owner-name=Drew DeVault
+owner-email=sir@cmpwn.com
+#
+# The source code for your fork of sr.ht
+source-url=https://git.sr.ht/~sircmpwn/srht
+#
+# A secret key to encrypt session cookies with
+secret-key=CHANGEME
+
+[mail]
+#
+# Outgoing SMTP settings
+smtp-host=
+smtp-port=
+smtp-user=
+smtp-password=
+smtp-from=
+#
+# Application exceptions are emailed to this address
+error-to=
+error-from=
+#
+# Your PGP key information (DO NOT mix up pub and priv here)
+# You must remove the password from your secret key, if present.
+# You can do this with gpg --edit-key [key-id], then use the passwd
+# command and do not enter a new password.
+pgp-privkey=
+pgp-pubkey=
+pgp-key-id=
+
+[webhooks]
+#
+# base64-encoded Ed25519 key for signing webhook payloads. This should be
+# consistent for all *.sr.ht sites, as we'll use this key to verify signatures
+# from other sites in your network.
+#
+# Use the srht-webhook-keygen command to generate a key.
+private-key=vUxJU88d5yqMZIiE8AhGSzKvlvx678+7990i06gZJ3w=
+
+[git.sr.ht]
+# 
+# URL git.sr.ht is being served at (protocol://domain)
+origin=http://localhost
+#
+# Address and port to bind the debug server to
+debug-host=0.0.0.0
+debug-port=5001
+#
+# Configures the SQLAlchemy connection string for the database.
+connection-string=postgresql://postgres:postgres@localhost/git.sr.ht
+#
+# Set to "yes" to automatically run migrations on package upgrade.
+migrate-on-upgrade=yes
+#
+# The redis connection used for the webhooks worker
+webhooks=redis://localhost:6379/1
+#
+# A post-update script which is installed in every git repo.
+post-update-script=/usr/bin/gitsrht-update-hook
+#
+# git.sr.ht's OAuth client ID and secret for meta.sr.ht
+# Register your client at meta.example.org/oauth
+oauth-client-id=CHANGEME
+oauth-client-secret=CHANGEME
+#
+# Path to git repositories on disk
+repos=/var/lib/gitsrht/
+
+[git.sr.ht::dispatch]
+#
+# The authorized keys hook uses this to dispatch to various handlers
+# The format is a program to exec into as the key, and the user to match as the
+# value. When someone tries to log in as this user, this program is executed
+# and is expected to omit an AuthorizedKeys file.
+#
+# Uncomment the relevant lines to enable the various sr.ht dispatchers.
+/usr/bin/gitsrht-keys=git:git
+#/usr/bin/man-srht-keys=man:man
+
+
+[meta.sr.ht]
+# 
+# URL meta.sr.ht is being served at (protocol://domain)
+origin=http://localhost
+#
+# Address and port to bind the debug server to
+debug-host=0.0.0.0
+debug-port=5000
+#
+# Configures the SQLAlchemy connection string for the database.
+connection-string=postgresql://postgres:postgres@localhost/meta.sr.ht
+#
+# Set to "yes" to automatically run migrations on package upgrade.
+migrate-on-upgrade=yes
+#
+# If "yes", the user will be sent the stock sourcehut welcome emails after
+# signup (requires cron to be configured properly). These are specific to the
+# sr.ht instance so you probably want to patch these before enabling this.
+welcome-emails=no
+
+[meta.sr.ht::settings]
+# 
+# If "no", public registration will not be permitted.
+registration=no
+#
+# Where to redirect new users upon registration
+onboarding-redirect=http://example.org
+#
+# How many invites each user is issued upon registration (only applicable if
+# open registration is disabled)
+user-invites=5
+
+[meta.sr.ht::aliases]
+#
+# You can add aliases for the client IDs of commonly used OAuth clients here.
+#
+# Example:
+# git.sr.ht=12345
+
+[meta.sr.ht::billing]
+#
+# "yes" to enable the billing system
+enabled=no
+#
+# Get your keys at https://dashboard.stripe.com/account/apikeys
+stripe-public-key=
+stripe-secret-key=
+
+
+# Uncomment this to provide optional builds.sr.ht integration
+#[builds.sr.ht]
+#origin=http://localhost
+#oauth-client-id=CHANGEME
+
+[dispatch.sr.ht]
+# 
+# URL dispatch.sr.ht is being served at (protocol://domain)
+origin=http://localhost
+#
+# Address and port to bind the debug server to
+debug-host=0.0.0.0
+debug-port=5005
+#
+# Configures the SQLAlchemy connection string for the database.
+connection-string=postgresql://postgres:postgres@localhost/git.sr.ht
+
+#
+# Set to "yes" to automatically run migrations on package upgrade.
+migrate-on-upgrade=yes
+#
+# dispatch.sr.ht's OAuth client ID and secret for meta.sr.ht
+# Register your client at meta.example.org/oauth
+oauth-client-id=
+oauth-client-secret=
+
+* nginx.conf
+Note: TLS configuration deferred for now.
+
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+	worker_connections 768;
+	# multi_accept on;
+}
+
+http {
+
+	##
+	# Basic Settings
+	##
+
+	sendfile on;
+	tcp_nopush on;
+	tcp_nodelay on;
+	keepalive_timeout 65;
+	types_hash_max_size 2048;
+	# server_tokens off;
+
+	# server_names_hash_bucket_size 64;
+	# server_name_in_redirect off;
+
+	include /etc/nginx/mime.types;
+	default_type application/octet-stream;
+
+	##
+	# SSL Settings
+	##
+
+	ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3; # Dropping SSLv3, ref: POODLE
+	ssl_prefer_server_ciphers on;
+
+	##
+	# Logging Settings
+	##
+
+	access_log /var/log/nginx/access.log;
+	error_log /var/log/nginx/error.log;
+
+	##
+	# Gzip Settings
+	##
+
+	gzip on;
+
+	# gzip_vary on;
+	# gzip_proxied any;
+	# gzip_comp_level 6;
+	# gzip_buffers 16 8k;
+	# gzip_http_version 1.1;
+	# gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+	##
+	# Virtual Host Configs
+	##
+
+	server {
+		listen 80;
+		
+		location / {
+			proxy_pass http://127.0.0.1:5001;
+		}
+
+		location /static {
+			root /usr/lib/python3/dist-packages/metasrht;
+		}
+
+		location ^~ /.well-known {
+		        root /var/www;
+		}
+
+		location = /authorize {
+		    proxy_pass http://127.0.0.1:5001;
+    		    proxy_pass_request_body off;
+    		    proxy_set_header Content-Length "";
+    		    proxy_set_header X-Original-URI $request_uri;
+		}
+
+		location ~ ^.*/(HEAD|info/refs|objects/info/.*|git-(upload|receive)-pack).*$ {
+    			 auth_request /authorize;
+    			 root /var/lib/git;
+    			 fastcgi_pass unix:/run/fcgiwrap.sock;
+    			 fastcgi_param SCRIPT_FILENAME /usr/lib/git-core/git-http-backend;
+    			 fastcgi_param PATH_INFO $uri;
+    			 fastcgi_param GIT_PROJECT_ROOT $document_root;
+    			 fastcgi_param GIT_HTTP_EXPORT_ALL "";
+    			 include fastcgi_params;
+    			 gzip off;
+		}
+	}
+
+	include /etc/nginx/conf.d/*.conf;
+	include /etc/nginx/sites-enabled/*;
+}
